@@ -140,6 +140,124 @@ def handle_scroll(address, *args):
             else:
                 pyautogui.scroll(scroll_amount, _pause=False)
 
+# === Dual Joystick State ===
+joy_left = [0.0, 0.0]   # Coarse control (high gain)
+joy_right = [0.0, 0.0]  # Fine control (low gain)
+joy_active = False
+joy_thread = None
+
+# Joystick settings
+JOY_DEADZONE = 0.1
+JOY_COARSE_GAIN = 25  # pixels per update at full deflection
+JOY_FINE_GAIN = 5     # pixels per update at full deflection  
+JOY_EXPONENT = 2      # Power curve exponent
+JOY_UPDATE_RATE = 60  # Hz
+
+def process_joystick_input(raw_x, raw_y, deadzone=JOY_DEADZONE):
+    """Apply radial deadzone and rescale."""
+    magnitude = math.sqrt(raw_x**2 + raw_y**2)
+    if magnitude < deadzone:
+        return 0.0, 0.0
+    # Rescale magnitude to start from edge of deadzone
+    normalized_mag = (magnitude - deadzone) / (1.0 - deadzone)
+    scale = normalized_mag / magnitude
+    return raw_x * scale, raw_y * scale
+
+def get_velocity(nx, ny, gain, exponent=JOY_EXPONENT):
+    """Calculate velocity vector with power curve."""
+    # Preserve sign while applying power curve
+    vx = math.copysign(abs(nx) ** exponent, nx) * gain
+    vy = math.copysign(abs(ny) ** exponent, ny) * gain
+    return vx, vy
+
+def joystick_update_loop():
+    """Background thread that updates cursor based on joystick state."""
+    global joy_active
+    interval = 1.0 / JOY_UPDATE_RATE
+    
+    # Accumulate fractional movement
+    accum_x, accum_y = 0.0, 0.0
+    
+    while joy_active:
+        # Process left stick (coarse)
+        lx, ly = process_joystick_input(joy_left[0], joy_left[1])
+        cx, cy = get_velocity(lx, ly, JOY_COARSE_GAIN)
+        
+        # Process right stick (fine)
+        rx, ry = process_joystick_input(joy_right[0], joy_right[1])
+        fx, fy = get_velocity(rx, ry, JOY_FINE_GAIN)
+        
+        # Combined velocity (accumulate to handle sub-pixel movement)
+        accum_x += cx + fx
+        accum_y += cy + fy
+        
+        # Only move whole pixels, keep fractional part for next update
+        move_x = int(accum_x)
+        move_y = int(accum_y)
+        
+        if move_x != 0 or move_y != 0:
+            # Y is already correct: positive Y in joystick = up on screen
+            pyautogui.moveRel(move_x, -move_y, _pause=False)
+            accum_x -= move_x
+            accum_y -= move_y
+        
+        time.sleep(interval)
+
+def start_joystick_thread():
+    """Start the joystick update loop if not already running."""
+    global joy_active, joy_thread
+    if not joy_active:
+        joy_active = True
+        joy_thread = threading.Thread(target=joystick_update_loop, daemon=True)
+        joy_thread.start()
+        print("Joystick mode activated")
+
+def handle_joy_left(address, *args):
+    """Handle /joy-left OSC messages (coarse cursor control)."""
+    global joy_left
+    if len(args) >= 2:
+        joy_left = [float(args[0]), float(args[1])]
+        start_joystick_thread()
+
+def handle_joy_right(address, *args):
+    """Handle /joy-right OSC messages (fine cursor control)."""
+    global joy_right
+    if len(args) >= 2:
+        joy_right = [float(args[0]), float(args[1])]
+        start_joystick_thread()
+
+def handle_joy_left_gain(address, *args):
+    """Handle /joy-left-gain OSC messages (coarse sensitivity)."""
+    global JOY_COARSE_GAIN
+    if len(args) >= 1:
+        JOY_COARSE_GAIN = float(args[0])
+        print(f"Left joystick gain: {JOY_COARSE_GAIN}")
+
+def handle_joy_right_gain(address, *args):
+    """Handle /joy-right-gain OSC messages (fine sensitivity)."""
+    global JOY_FINE_GAIN
+    if len(args) >= 1:
+        JOY_FINE_GAIN = float(args[0])
+        print(f"Right joystick gain: {JOY_FINE_GAIN}")
+
+def handle_scroll_wheel(address, *args):
+    """Handle /scroll-wheel encoder (continuous scroll)."""
+    if len(args) >= 1:
+        scroll_amount = int(args[0])
+        if QUARTZ_AVAILABLE:
+            event = CGEventCreateScrollWheelEvent(
+                None, kCGScrollEventUnitLine, 1, scroll_amount
+            )
+            CGEventPost(kCGHIDEventTap, event)
+        else:
+            pyautogui.scroll(scroll_amount, _pause=False)
+
+def handle_scroll_pos(address, *args):
+    """Handle /scroll-pos knob (page position indicator - visual only for now)."""
+    # This could be used to jump to a specific scroll position
+    # For now, just acknowledge receipt
+    pass
+
 # === Multi-touch gesture state ===
 touch_points = {}  # Track multiple touch points
 last_pinch_distance = None
@@ -224,6 +342,14 @@ def main():
     disp.map("/right", handle_right)
     disp.map("/scroll", handle_scroll)
     
+    # Dual joystick (coarse/fine)
+    disp.map("/joy-left", handle_joy_left)
+    disp.map("/joy-right", handle_joy_right)
+    disp.map("/joy-left-gain", handle_joy_left_gain)
+    disp.map("/joy-right-gain", handle_joy_right_gain)
+    disp.map("/scroll-wheel", handle_scroll_wheel)
+    disp.map("/scroll-pos", handle_scroll_pos)
+    
     # Magic trackpad (multi-touch)
     disp.map("/multixy", handle_multixy)
     disp.map("/multixy/tap", handle_multixy_tap)
@@ -235,15 +361,12 @@ def main():
     print(f"  Screen: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
     print(f"  Quartz scroll: {'Yes' if QUARTZ_AVAILABLE else 'No (fallback)'}")
     print()
-    print("Supported addresses:")
-    print("  /trackpad x y    - Cursor movement")
-    print("  /tap 1           - Left click")
-    print("  /left 0|1        - Left button hold")
-    print("  /right 0|1       - Right button hold")
-    print("  /scroll n        - Scroll wheel")
-    print("  /speed n         - Speed multiplier")
-    print("  /curve type      - Acceleration curve")
-    print("  /multixy x1 y1 x2 y2 - Multi-touch")
+    print("Joystick Tab:")
+    print("  /joy-left x y        - Coarse cursor (left stick)")
+    print("  /joy-right x y       - Fine cursor (right stick)")
+    print("  /joy-left-gain n     - Left stick sensitivity")
+    print("  /joy-right-gain n    - Right stick sensitivity")
+    print("  /scroll-wheel n      - Scroll (encoder)")
     print()
 
     try:
